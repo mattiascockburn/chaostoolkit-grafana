@@ -1,5 +1,8 @@
 import logging
+from os import environ
 import time
+import warnings
+import contextlib
 from secrets import token_hex
 from typing import Any, Dict
 
@@ -8,10 +11,45 @@ from chaoslib import __version__, experiment_hash
 from chaoslib.run import EventHandlerRegistry, RunEventHandler
 from chaoslib.types import Activity, Experiment, Journal, Run, Secrets
 from logzero import logger as ctk_logger
+import requests
+from urllib3.exceptions import InsecureRequestWarning
 
 __all__ = ["configure_control"]
 DEFAULT_LOKI_URL = "http://localhost:3100"
 loki_logger = logging.getLogger("chaostoolkit-loki")
+
+
+old_merge_environment_settings = requests.Session.merge_environment_settings
+
+@contextlib.contextmanager
+def adjust_tls_verification(verify=True):
+    opened_adapters = set()
+
+    def merge_environment_settings(self, url, proxies, stream, verify=verify, cert):
+        # Verification happens only once per connection so we need to close
+        # all the opened adapters once we're done. Otherwise, the effects of
+        # verify=False persist beyond the end of this context manager.
+        opened_adapters.add(self.get_adapter(url))
+
+        settings = old_merge_environment_settings(self, url, proxies, stream, verify, cert)
+        settings['verify'] = verify
+
+        return settings
+
+    requests.Session.merge_environment_settings = merge_environment_settings
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', InsecureRequestWarning)
+            yield
+    finally:
+        requests.Session.merge_environment_settings = old_merge_environment_settings
+
+        for adapter in opened_adapters:
+            try:
+                adapter.close()
+            except:
+                pass
 
 
 def configure_control(
@@ -22,6 +60,7 @@ def configure_control(
     tags: Dict[str, str] = None,
     experiment_ref: str = None,
     trace_id: str = None,
+    verify_tls: bool = environ.get("VERIFY_TLS", "true").upper() == "TRUE"
 ) -> None:
     """
     Configure a Python logger that sends its messages to a Loki endpoint.
@@ -64,13 +103,14 @@ def configure_control(
         tags.update(experiment_tags)
 
     logging_loki.emitter.LokiEmitter.level_tag = "level"
-    handler = logging_loki.LokiHandler(
-        url=url, tags=tags, auth=auth, version="1"
-    )
-    handler.emitter = FixedLokiEmitterV1(url, tags, auth)
-    handler.setLevel(logging.INFO)
-    loki_logger.addHandler(handler)
-    loki_logger.setLevel(logging.INFO)
+    with adjust_tls_verification(verify=verify_tls):
+        handler = logging_loki.LokiHandler(
+            url=url, tags=tags, auth=auth, version="1"
+        )
+        handler.emitter = FixedLokiEmitterV1(url, tags, auth)
+        handler.setLevel(logging.INFO)
+        loki_logger.addHandler(handler)
+        loki_logger.setLevel(logging.INFO)
 
     event_registry.register(LokiRunEventHandler())
 
